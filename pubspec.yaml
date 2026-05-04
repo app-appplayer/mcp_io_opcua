@@ -1,6 +1,6 @@
 name: mcp_io_opcua
 description: OPC UA Binary adapter (MVP) for mcp_io. Hello/Ack transport codec + OpcUaSession abstraction.
-version: 0.1.0
+version: 0.2.0
 homepage: https://app-appplayer.github.io/makemind
 repository: https://github.com/app-appplayer/mcp_io_opcua
 issue_tracker: https://github.com/app-appplayer/mcp_io_opcua/issues
@@ -16,9 +16,12 @@ environment:
   sdk: ^3.7.2
 
 dependencies:
-  mcp_io: ^0.1.0
+  mcp_io: ^0.2.0
   mcp_bundle: ^0.3.0
   meta: ^1.15.0
+  # Pure-Dart crypto primitives — used by Basic256Sha256 / Aes*
+  # SecurityPolicy implementations. Web-safe (no dart:ffi).
+  pointycastle: ^3.9.0
 
 dev_dependencies:
   lints: ^5.0.0

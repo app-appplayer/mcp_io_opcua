@@ -43,11 +43,24 @@ class OpcUaAdapter extends AdapterBase {
 
   static final AdapterManifest _defaultManifest = AdapterManifest(
     adapterId: 'mcp_io_opcua',
-    adapterVersion: '0.1.0',
+    adapterVersion: '0.2.0',
     contractVersionRange: '>=0.1.0 <1.0.0',
     displayName: 'OPC UA Binary Adapter',
-    description: 'OPC UA Binary MVP adapter — read/write via OpcUaSession; '
-        'polling subscribe.',
+    description:
+        'OPC UA Binary adapter — Variant 25 built-in types, NodeId 5 encodings, '
+        'DataValue mask, ExtensionObject, polling subscribe. Service set '
+        '(Open/CloseSecureChannel, CreateSession/ActivateSession, Read/Write/'
+        'Browse/CallMethod, Subscription/MonitoredItems/Publish) deferred to '
+        'C-3b~f.',
+    capabilities: const [
+      CapabilityDescriptor(action: 'opcua.browse', safetyClass: SafetyClass.safe),
+      CapabilityDescriptor(action: 'opcua.read', safetyClass: SafetyClass.safe),
+      CapabilityDescriptor(action: 'opcua.write', safetyClass: SafetyClass.guarded),
+      CapabilityDescriptor(action: 'opcua.call_method', safetyClass: SafetyClass.guarded),
+      CapabilityDescriptor(action: 'opcua.subscribe_data', safetyClass: SafetyClass.safe),
+      CapabilityDescriptor(action: 'opcua.subscribe_event', safetyClass: SafetyClass.safe),
+      CapabilityDescriptor(action: 'opcua.history_read', safetyClass: SafetyClass.safe),
+    ],
   );
 
   // === Lifecycle ===
@@ -103,24 +116,23 @@ class OpcUaAdapter extends AdapterBase {
   Future<CommandResult> execute(Command command) async {
     try {
       switch (command.action) {
+        // Legacy + canonical write.
         case 'write':
-          final nodeId = _resolveNodeId(command);
-          if (!command.args.containsKey('value')) {
-            return CommandResult(
-              status: CommandStatus.rejected,
-              error: IoError(
-                code: 'exec.invalid_args',
-                message: 'write requires args["value"]',
-                timestamp: DateTime.now(),
-              ),
-            );
-          }
-          final variant = OpcUaVariant.fromDart(command.args['value']);
-          await _session.write(nodeId, variant);
-          return CommandResult(
-            status: CommandStatus.completed,
-            result: {'nodeId': nodeId.toStandardString()},
-          );
+        case 'opcua.write':
+          return await _doWrite(command);
+
+        case 'opcua.read':
+          return await _doRead(command);
+        case 'opcua.browse':
+          return await _doBrowse(command);
+        case 'opcua.call_method':
+          return await _doCallMethod(command);
+        case 'opcua.history_read':
+          return await _doHistoryRead(command);
+        case 'opcua.subscribe_data':
+        case 'opcua.subscribe_event':
+          return _doSubscribeAck(command);
+
         default:
           return CommandResult(
             status: CommandStatus.rejected,
@@ -138,6 +150,141 @@ class OpcUaAdapter extends AdapterBase {
       );
     }
   }
+
+  // === Capability dispatch helpers ===
+
+  Future<CommandResult> _doWrite(Command command) async {
+    final nodeId = _resolveNodeId(command);
+    if (!command.args.containsKey('value')) {
+      return _argError('write requires args["value"]');
+    }
+    final variant = OpcUaVariant.fromDart(command.args['value']);
+    await _session.write(nodeId, variant);
+    return CommandResult(
+      status: CommandStatus.completed,
+      result: {'nodeId': nodeId.toStandardString()},
+    );
+  }
+
+  Future<CommandResult> _doRead(Command command) async {
+    final nodeId = _resolveNodeId(command);
+    final variant = await _session.read(nodeId);
+    return CommandResult(
+      status: CommandStatus.completed,
+      result: {
+        'nodeId': nodeId.toStandardString(),
+        'value': variant.value,
+        'kind': variant.kind.name,
+      },
+    );
+  }
+
+  /// `opcua.browse` returns a list of reference descriptions reachable from
+  /// the supplied NodeId. Args:
+  ///   - target / args.namespace+args.numeric+args.string: NodeId source.
+  ///   - args.maxResults (int, optional): cap the number of references.
+  Future<CommandResult> _doBrowse(Command command) async {
+    final from = _resolveNodeId(command);
+    final maxResults = command.args['maxResults'] as int?;
+    final refs = await _session.browse(from, maxResults: maxResults);
+    return CommandResult(
+      status: CommandStatus.completed,
+      result: {
+        'from': from.toStandardString(),
+        'references': [for (final r in refs) r.toJson()],
+      },
+    );
+  }
+
+  /// `opcua.call_method` invokes an OPC UA Method.
+  /// Args:
+  ///   - object: NodeId of the target object (string form, e.g. `ns=2;i=1`).
+  ///   - method: NodeId of the method.
+  ///   - inputs (List, optional): argument values converted via
+  ///     [OpcUaVariant.fromDart].
+  Future<CommandResult> _doCallMethod(Command command) async {
+    final objectArg = command.args['object'] as String?;
+    final methodArg = command.args['method'] as String?;
+    if (objectArg == null || methodArg == null) {
+      return _argError('opcua.call_method requires args["object"] and args["method"]');
+    }
+    final object = OpcUaNodeId.parse(objectArg);
+    final method = OpcUaNodeId.parse(methodArg);
+    final inputs = (command.args['inputs'] as List?)
+            ?.map(OpcUaVariant.fromDart)
+            .toList() ??
+        const <OpcUaVariant>[];
+    final r = await _session.callMethod(object, method, inputs);
+    return CommandResult(
+      status: r.isGood ? CommandStatus.completed : CommandStatus.failed,
+      result: {
+        'object': object.toStandardString(),
+        'method': method.toStandardString(),
+        'statusCode': r.statusCode,
+        'outputs': [for (final v in r.outputArguments) v.value],
+      },
+      error: r.isGood
+          ? null
+          : IoError(
+              code: 'protocol.method_failed',
+              message: 'OPC UA method returned 0x${r.statusCode.toRadixString(16)}',
+              timestamp: DateTime.now(),
+            ),
+    );
+  }
+
+  /// `opcua.history_read` fetches historic data points for a NodeId.
+  /// Args:
+  ///   - target / namespace+numeric|string: NodeId.
+  ///   - from / to (ISO-8601 strings): time window.
+  ///   - maxValues (int, optional).
+  Future<CommandResult> _doHistoryRead(Command command) async {
+    final nodeId = _resolveNodeId(command);
+    final fromArg = command.args['from'] as String?;
+    final toArg = command.args['to'] as String?;
+    if (fromArg == null || toArg == null) {
+      return _argError('opcua.history_read requires args["from"] and args["to"] (ISO-8601)');
+    }
+    final from = DateTime.parse(fromArg);
+    final to = DateTime.parse(toArg);
+    final maxValues = command.args['maxValues'] as int?;
+    final points = await _session.historyRead(
+      nodeId, from: from, to: to, maxValues: maxValues,
+    );
+    return CommandResult(
+      status: CommandStatus.completed,
+      result: {
+        'nodeId': nodeId.toStandardString(),
+        'from': from.toIso8601String(),
+        'to': to.toIso8601String(),
+        'count': points.length,
+        'points': [for (final p in points) p.toJson()],
+      },
+    );
+  }
+
+  /// Returns a confirmation that the target NodeId / event-type is parseable;
+  /// the actual stream is obtained from the [subscribe] primitive.
+  CommandResult _doSubscribeAck(Command command) {
+    try {
+      _resolveNodeId(command);
+    } on Object catch (e) {
+      return _argError('invalid NodeId: $e');
+    }
+    return CommandResult(
+      status: CommandStatus.completed,
+      result: {'nodeId': _resolveNodeId(command).toStandardString()},
+    );
+  }
+
+  CommandResult _argError(String reason) => CommandResult(
+        status: CommandStatus.rejected,
+        error: IoError(
+          code: 'exec.invalid_args',
+          message: reason,
+          timestamp: DateTime.now(),
+        ),
+      );
 
   @override
   Stream<PayloadEnvelope> subscribe(TopicSpec spec) {

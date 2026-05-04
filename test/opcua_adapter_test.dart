@@ -254,4 +254,164 @@ void main() {
       expect(d.transport, 'opc.tcp');
     });
   });
+
+  group('capability dispatch (0.2.0)', () {
+    test('opcua.read returns the seeded scalar value', () async {
+      final session = InMemoryOpcUaSession();
+      session.seed(
+        OpcUaNodeId.numeric(namespace: 2, identifier: 1001),
+        const OpcUaVariant.double(42.0),
+      );
+      final adapter = _adapter(session);
+      await adapter.connect();
+      final r = await adapter.execute(const Command(
+        action: 'opcua.read', target: 'ns=2;i=1001',
+      ));
+      expect(r.status, CommandStatus.completed);
+      expect(r.result?['value'], 42.0);
+      expect(r.result?['kind'], 'double');
+    });
+
+    test('opcua.write routes through the session and updates the store',
+        () async {
+      final session = InMemoryOpcUaSession();
+      final adapter = _adapter(session);
+      await adapter.connect();
+      final r = await adapter.execute(const Command(
+        action: 'opcua.write', target: 'ns=2;s=Setpoint',
+        args: {'value': 7},
+      ));
+      expect(r.status, CommandStatus.completed);
+      expect(session.writeCount, 1);
+      final after = session.snapshot();
+      expect(
+        after[OpcUaNodeId.string(namespace: 2, identifier: 'Setpoint')]?.value,
+        7,
+      );
+    });
+
+    test('opcua.browse returns seeded references with maxResults respected',
+        () async {
+      final from = OpcUaNodeId.numeric(namespace: 0, identifier: 84);
+      final session = InMemoryOpcUaSession();
+      session.seedReferences(from, [
+        OpcUaReferenceDescription(
+          targetNodeId: OpcUaNodeId.numeric(namespace: 0, identifier: 85),
+          browseName: '0:Objects',
+          displayName: 'Objects',
+        ),
+        OpcUaReferenceDescription(
+          targetNodeId: OpcUaNodeId.numeric(namespace: 0, identifier: 86),
+          browseName: '0:Types',
+          displayName: 'Types',
+        ),
+      ]);
+      final adapter = _adapter(session);
+      await adapter.connect();
+      final r = await adapter.execute(const Command(
+        action: 'opcua.browse', target: 'ns=0;i=84',
+        args: {'maxResults': 1},
+      ));
+      expect(r.status, CommandStatus.completed);
+      expect((r.result!['references'] as List), hasLength(1));
+      expect((r.result!['references'] as List).first['browseName'], '0:Objects');
+    });
+
+    test('opcua.call_method invokes the registered handler', () async {
+      final obj = OpcUaNodeId.numeric(namespace: 2, identifier: 1);
+      final mth = OpcUaNodeId.numeric(namespace: 2, identifier: 2);
+      final session = InMemoryOpcUaSession();
+      session.registerMethod(obj, mth, (inputs) {
+        final a = inputs[0].value as int;
+        final b = inputs[1].value as int;
+        return OpcUaCallResult(
+          outputArguments: [OpcUaVariant.int32(a + b)],
+        );
+      });
+      final adapter = _adapter(session);
+      await adapter.connect();
+      final r = await adapter.execute(const Command(
+        action: 'opcua.call_method', target: '',
+        args: {
+          'object': 'ns=2;i=1',
+          'method': 'ns=2;i=2',
+          'inputs': [3, 4],
+        },
+      ));
+      expect(r.status, CommandStatus.completed);
+      expect(r.result?['outputs'], [7]);
+    });
+
+    test('opcua.call_method reports failed status code', () async {
+      final session = InMemoryOpcUaSession();
+      final adapter = _adapter(session);
+      await adapter.connect();
+      final r = await adapter.execute(const Command(
+        action: 'opcua.call_method', target: '',
+        args: {'object': 'ns=2;i=1', 'method': 'ns=2;i=99'},
+      ));
+      expect(r.status, CommandStatus.failed);
+      expect(r.error?.code, 'protocol.method_failed');
+    });
+
+    test('opcua.history_read returns points within the window', () async {
+      final node = OpcUaNodeId.numeric(namespace: 2, identifier: 10);
+      final session = InMemoryOpcUaSession();
+      final t0 = DateTime.utc(2026, 5, 2, 12, 0, 0);
+      for (var i = 0; i < 5; i++) {
+        session.seedHistory(node, OpcUaHistoryDataPoint(
+          value: OpcUaVariant.double(i.toDouble()),
+          sourceTimestamp: t0.add(Duration(minutes: i)),
+        ));
+      }
+      final adapter = _adapter(session);
+      await adapter.connect();
+      final r = await adapter.execute(Command(
+        action: 'opcua.history_read', target: 'ns=2;i=10',
+        args: {
+          'from': t0.add(const Duration(minutes: 1)).toIso8601String(),
+          'to': t0.add(const Duration(minutes: 3)).toIso8601String(),
+        },
+      ));
+      expect(r.status, CommandStatus.completed);
+      expect(r.result?['count'], 3);
+    });
+
+    test('opcua.subscribe_data + subscribe_event ack a parseable NodeId',
+        () async {
+      final session = InMemoryOpcUaSession();
+      final adapter = _adapter(session);
+      await adapter.connect();
+      final d = await adapter.execute(const Command(
+        action: 'opcua.subscribe_data', target: 'ns=2;i=10',
+      ));
+      final e = await adapter.execute(const Command(
+        action: 'opcua.subscribe_event', target: 'ns=0;i=2253',
+      ));
+      expect(d.status, CommandStatus.completed);
+      expect(e.status, CommandStatus.completed);
+    });
+
+    test('opcua.write rejects when value missing', () async {
+      final session = InMemoryOpcUaSession();
+      final adapter = _adapter(session);
+      await adapter.connect();
+      final r = await adapter.execute(const Command(
+        action: 'opcua.write', target: 'ns=2;i=1',
+      ));
+      expect(r.status, CommandStatus.rejected);
+      expect(r.error?.code, 'exec.invalid_args');
+    });
+
+    test('opcua.history_read rejects when window missing', () async {
+      final session = InMemoryOpcUaSession();
+      final adapter = _adapter(session);
+      await adapter.connect();
+      final r = await adapter.execute(const Command(
+        action: 'opcua.history_read', target: 'ns=2;i=10',
+      ));
+      expect(r.status, CommandStatus.rejected);
+      expect(r.error?.code, 'exec.invalid_args');
+    });
+  });
 }

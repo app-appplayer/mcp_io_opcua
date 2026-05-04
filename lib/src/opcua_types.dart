@@ -140,3 +140,62 @@ class OpcUaProtocolError implements Exception {
   @override
   String toString() => 'OpcUaProtocolError: $message';
 }
+
+/// Single entry returned by Browse — describes one reference from a node.
+/// A subset of OPC UA Part 4 § 5.8.2 ReferenceDescription.
+class OpcUaReferenceDescription {
+  final OpcUaNodeId targetNodeId;
+  final String browseName;
+  final String displayName;
+  final OpcUaNodeId? referenceTypeId;
+
+  const OpcUaReferenceDescription({
+    required this.targetNodeId,
+    required this.browseName,
+    required this.displayName,
+    this.referenceTypeId,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'nodeId': targetNodeId.toStandardString(),
+        'browseName': browseName,
+        'displayName': displayName,
+        if (referenceTypeId != null)
+          'referenceTypeId': referenceTypeId!.toStandardString(),
+      };
+}
+
+/// Result of a Call service invocation (OPC UA Part 4 § 5.11.2).
+class OpcUaCallResult {
+  /// 0 = Good. Non-zero = OPC UA status code.
+  final int statusCode;
+  final List<OpcUaVariant> outputArguments;
+  final List<int> inputArgumentResults;
+
+  const OpcUaCallResult({
+    this.statusCode = 0,
+    this.outputArguments = const [],
+    this.inputArgumentResults = const [],
+  });
+
+  bool get isGood => statusCode == 0;
+}
+
+/// One historic value returned by HistoryRead.
+class OpcUaHistoryDataPoint {
+  final OpcUaVariant value;
+  final DateTime sourceTimestamp;
+  final int statusCode;
+
+  const OpcUaHistoryDataPoint({
+    required this.value,
+    required this.sourceTimestamp,
+    this.statusCode = 0,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'value': value.value,
+        'sourceTimestamp': sourceTimestamp.toIso8601String(),
+        'statusCode': statusCode,
+      };
+}
